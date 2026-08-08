@@ -1,0 +1,209 @@
+--- a/include/hw/char/serial.h	2025-05-28 23:35:40.000000000 +0300
++++ b/include/hw/char/serial.h	2026-08-01 20:24:36.359593900 +0300
+@@ -75,6 +75,37 @@
+     int poll_msl;
+ 
+     QEMUTimer *modem_status_poll;
++
++    /* Пейсинг передачи.
++     *
++     * В стоковой модели байт уходит в backend мгновенно, а THRE
++     * выставляется обратно в том же обработчике записи. Гость никогда не
++     * застаёт передатчик занятым, поэтому код, забывший опрашивать THRE,
++     * работает как ни в чём не бывало. На железе он потерял бы данные.
++     *
++     * Таймер держит THRE снятым в течение char_transmit_time, то есть
++     * ровно столько, сколько байт физически ехал бы по линии на текущей
++     * скорости.
++     */
++    QEMUTimer *xmit_pacing_timer;
++
++    /* Включается свойством устройства. По умолчанию выключено, и тогда
++     * модель ведёт себя ровно как раньше.
++     *
++     * xmit_pacing       — выдерживать темп, который задал сам гость
++     *                     делителем скорости;
++     * xmit_pacing_baud  — если не ноль, выдерживать эту скорость в бодах
++     *                     независимо от того, что запрограммировал гость,
++     *                     и заодно включить пейсинг.
++     */
++    bool xmit_pacing;
++    uint32_t xmit_pacing_baud;
++
++    /* Время передачи одного символа для пейсинга. Отдельно от
++     * char_transmit_time, потому что тот расходуется на таймауты FIFO
++     * и опрос модемного статуса, и подменять его нельзя. */
++    uint64_t pacing_char_time;
++
+     MemoryRegion io;
+ };
+ typedef struct SerialState SerialState;
+--- a/hw/char/serial.c	2025-05-28 23:35:40.000000000 +0300
++++ b/hw/char/serial.c	2026-08-01 20:25:09.956171700 +0300
+@@ -178,6 +178,20 @@
+     ssp.data_bits = data_bits;
+     ssp.stop_bits = stop_bits;
+     s->char_transmit_time =  (NANOSECONDS_PER_SECOND / speed) * frame_size;
++
++    /*
++     * Время символа для пейсинга. Если свойством задана скорость, берём
++     * её и игнорируем делитель гостя: это позволяет показать поведение
++     * линии на 300, 9600 или 115200 бод, ничего не меняя в самой
++     * программе. Длина кадра при этом настоящая, из LCR.
++     */
++    if (s->xmit_pacing_baud) {
++        s->pacing_char_time = (NANOSECONDS_PER_SECOND /
++                               (float) s->xmit_pacing_baud) * frame_size;
++    } else {
++        s->pacing_char_time = s->char_transmit_time;
++    }
++
+     qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
+     trace_serial_update_parameters(speed, parity, data_bits, stop_bits);
+ }
+@@ -281,6 +295,33 @@
+     s->lsr |= UART_LSR_TEMT;
+ }
+ 
++/*
++ * Пейсинг передачи: байт доехал по линии, передатчик снова свободен.
++ *
++ * Вызывается по таймеру через char_transmit_time после того, как байт
++ * был отдан в backend. До этого момента THRE снят, и гость, который
++ * честно опрашивает LSR, ждёт. Гость, который не опрашивает, затирает
++ * байт следующим и теряет его, ровно как на железе.
++ */
++/* Пейсинг включён, если попросили явно или задали скорость линии. */
++static bool serial_pacing_on(SerialState *s)
++{
++    return s->xmit_pacing || s->xmit_pacing_baud;
++}
++
++static void serial_xmit_pacing_done(void *opaque)
++{
++    SerialState *s = opaque;
++
++    s->lsr |= UART_LSR_THRE;
++    s->lsr |= UART_LSR_TEMT;
++
++    if (!s->thr_ipending) {
++        s->thr_ipending = 1;
++        serial_update_irq(s);
++    }
++}
++
+ /* Setter for FCR.
+    is_load flag means, that value is set while loading VM state
+    and interrupt should not be invoked */
+@@ -343,6 +384,21 @@
+             s->divider = deposit32(s->divider, 8 * addr, 8, val);
+             serial_update_parameters(s);
+         } else {
++            /*
++             * Пейсинг передачи, нефифошный режим.
++             *
++             * Передатчик занят: предыдущий байт ещё едет по линии, THRE
++             * снят. На настоящем 16550 запись в занятый THR затирает то,
++             * что там лежало, и байт пропадает бесследно. Стоковая модель
++             * этого не воспроизводит, потому что занятой она не бывает.
++             * Воспроизводим: запоминаем байт и уходим, ничего не отправив.
++             */
++            if (serial_pacing_on(s) &&
++                !(s->fcr & UART_FCR_FE) && !(s->lsr & UART_LSR_THRE)) {
++                s->thr = (uint8_t) val;
++                return;
++            }
++
+             s->thr = (uint8_t) val;
+             if(s->fcr & UART_FCR_FE) {
+                 /* xmit overruns overwrite data, so make space if needed */
+@@ -357,6 +413,21 @@
+             serial_update_irq(s);
+             if (s->tsr_retry == 0) {
+                 serial_xmit(s);
++
++                /*
++                 * serial_xmit отдал байт в backend и тут же вернул THRE.
++                 * Снимаем его снова и держим снятым char_transmit_time:
++                 * столько байт ехал бы по линии на текущей скорости.
++                 * Только для нефифошного режима, FIFO не трогаем.
++                 */
++                if (serial_pacing_on(s) &&
++                    !(s->fcr & UART_FCR_FE) && s->pacing_char_time) {
++                    s->lsr &= ~UART_LSR_THRE;
++                    s->lsr &= ~UART_LSR_TEMT;
++                    timer_mod(s->xmit_pacing_timer,
++                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                              s->pacing_char_time);
++                }
+             }
+         }
+         break;
+@@ -872,11 +943,21 @@
+     s->scr = 0;
+     s->tsr_retry = 0;
+     s->char_transmit_time = (NANOSECONDS_PER_SECOND / 9600) * 10;
++
++    /* До первой настройки линии гостем пейсинг считаем по той же
++       умолчательной скорости, либо по заданной свойством. */
++    if (s->xmit_pacing_baud) {
++        s->pacing_char_time = (NANOSECONDS_PER_SECOND /
++                               (float) s->xmit_pacing_baud) * 10;
++    } else {
++        s->pacing_char_time = s->char_transmit_time;
++    }
+     s->poll_msl = 0;
+ 
+     s->timeout_ipending = 0;
+     timer_del(s->fifo_timeout_timer);
+     timer_del(s->modem_status_poll);
++    timer_del(s->xmit_pacing_timer);
+ 
+     fifo8_reset(&s->recv_fifo);
+     fifo8_reset(&s->xmit_fifo);
+@@ -926,6 +1007,11 @@
+     s->modem_status_poll = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) serial_update_msl, s);
+ 
+     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) fifo_timeout_int, s);
++
++    /* Пейсинг передачи: держит THRE снятым, пока байт едет по линии. */
++    s->xmit_pacing_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                        serial_xmit_pacing_done, s);
++
+     qemu_register_reset(serial_reset, s);
+ 
+     qemu_chr_fe_set_handlers(&s->chr, serial_can_receive1, serial_receive1,
+@@ -945,6 +1031,8 @@
+ 
+     timer_free(s->fifo_timeout_timer);
+ 
++    timer_free(s->xmit_pacing_timer);
++
+     fifo8_destroy(&s->recv_fifo);
+     fifo8_destroy(&s->xmit_fifo);
+ 
+--- a/hw/char/serial-mm.c	2025-05-28 23:35:40.000000000 +0300
++++ b/hw/char/serial-mm.c	2026-08-01 20:25:15.885435900 +0300
+@@ -132,6 +132,22 @@
+      */
+     DEFINE_PROP_UINT8("regshift", SerialMM, regshift, 0),
+     DEFINE_PROP_UINT8("endianness", SerialMM, endianness, DEVICE_NATIVE_ENDIAN),
++    /*
++     * Выдерживать темп передачи по делителю скорости, который
++     * запрограммировал гость. По умолчанию выключено, поведение модели
++     * остаётся прежним.
++     *   -global serial-mm.xmit-pacing=on
++     */
++    DEFINE_PROP_BOOL("xmit-pacing", SerialMM, serial.xmit_pacing, false),
++    /*
++     * Скорость линии в бодах для пейсинга. Ноль означает «не задана».
++     * Ненулевое значение включает пейсинг и переопределяет делитель
++     * гостя, что удобно для программ, которые линию вообще не
++     * настраивают.
++     *   -global serial-mm.xmit-pacing-baud=9600
++     */
++    DEFINE_PROP_UINT32("xmit-pacing-baud", SerialMM,
++                       serial.xmit_pacing_baud, 0),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
